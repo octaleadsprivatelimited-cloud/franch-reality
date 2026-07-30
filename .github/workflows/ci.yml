@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: franch
+          POSTGRES_PASSWORD: franch_ci_pw
+          POSTGRES_DB: franch_realty
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U franch -d franch_realty"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql://franch:franch_ci_pw@localhost:5432/franch_realty?schema=public
+      AUTH_SECRET: ci-only-auth-secret-not-used-outside-tests
+      AUTH_URL: http://localhost:3100
+      CRON_SECRET: ci-only-cron-secret-not-used-outside-tests
+      TELEDUCE_API_BASE_URL: ""
+      TELEDUCE_API_KEY: ""
+      TELEDUCE_ALLOW_MOCK: "true"
+      SEED_DEFAULT_PASSWORD: LocalCiOnly!2026
+      SEED_MOCK_INVENTORY: "false"
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma Client
+        run: npm run db:generate
+
+      - name: Apply migrations
+        run: npm run db:deploy
+
+      - name: Seed reference data
+        run: npm run db:seed
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: Audit dependencies
+        run: npm audit --omit=dev --audit-level=high

@@ -1,0 +1,14 @@
+# One-off image to apply pending Prisma migrations against the prod DB from inside
+# Azure (run as a Container Apps Job with DATABASE_URL injected from the db-url secret).
+# Kept separate from the app image because the runtime image intentionally omits the
+# prisma CLI / migration engine.
+FROM node:22-alpine
+RUN apk add --no-cache libc6-compat openssl
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY prisma ./prisma
+COPY prisma.config.ts ./
+RUN DATABASE_URL="postgresql://build:build@localhost:5432/build" npx prisma generate
+# `migrate deploy` applies only committed, not-yet-applied migrations; never resets.
+CMD ["npx", "prisma", "migrate", "deploy"]
