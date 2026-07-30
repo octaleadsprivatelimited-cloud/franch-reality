@@ -1,0 +1,611 @@
+// Franch Realty platform data model.
+// The schema covers inventory, CRM leads, matching, assignment, audit history,
+// notifications, and customer conversations.
+//
+// Design notes for future extensibility:
+//  - Match.criteriaSnapshot + Match.band + Match.status preserve ranking signals.
+//  - Locality.latitude/longitude power the radius-band Haversine matching now; property-level
+//    coordinates can be added later without migration.
+//  - PropertyAttachment.kind already includes OTHER so site-visit photos can reuse it.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────── Enums ───────────────────────────
+
+enum Role {
+  ADMIN
+  AGENT
+}
+
+enum City {
+  HYDERABAD
+  CHENNAI
+}
+
+enum TransactionType {
+  SALE
+  RENT
+}
+
+enum PropertyType {
+  APARTMENT
+  VILLA
+  PLOT
+  COMMERCIAL
+}
+
+enum CommercialOrResidential {
+  RESIDENTIAL
+  COMMERCIAL
+}
+
+enum BuildingClassification {
+  GATED_COMMUNITY
+  STAND_ALONE
+  COMMERCIAL
+}
+
+enum PriceUnit {
+  LAKH
+  CRORE
+  PER_MONTH
+}
+
+enum Furnishing {
+  UNFURNISHED
+  SEMI_FURNISHED
+  FURNISHED
+}
+
+enum AvailabilityStatus {
+  AVAILABLE
+  BOOKED
+  SOLD
+  RENTED
+}
+
+enum AttachmentKind {
+  IMAGE
+  BROCHURE
+  FLOORPLAN
+  OTHER
+}
+
+enum MatchStatus {
+  SHORTLISTED
+  SHARED
+  CLOSED_WON
+  CLOSED_LOST
+  CLOSED_NEUTRAL
+}
+
+enum WritebackStatus {
+  NOT_REQUIRED
+  PENDING
+  SUCCESS
+  FAILED
+}
+
+enum SyncType {
+  TELEDUCE_PULL
+  TELEDUCE_WRITEBACK
+}
+
+enum SyncStatus {
+  RUNNING
+  SUCCESS
+  PARTIAL
+  FAILED
+}
+
+// An agent's personal working status on a lead assigned to them (distinct from the
+// read-only Teleduce pipeline stage, which syncs from Corefactors).
+enum AssignmentStatus {
+  NEW
+  ATTEMPTED
+  CONTACTED
+  SITE_VISIT_SCHEDULED
+  VISITED
+  NEGOTIATING
+  CLOSED_WON
+  CLOSED_LOST
+}
+
+// Where the platform's internal assignment came from. Corefactors ownership is
+// authoritative; the local round robin is used only while Corefactors has no owner.
+enum AssignmentSource {
+  COFACTORS
+  ROUND_ROBIN
+  MANUAL
+}
+
+// ─────────────────────────── Models ───────────────────────────
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  fullName     String
+  role         Role
+  cities       City[] // ADMIN typically [HYDERABAD, CHENNAI]; AGENT a subset
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  createdProperties Property[] @relation("PropertyCreatedBy")
+  actionedMatches   Match[]    @relation("MatchActionedBy")
+  auditLogs         AuditLog[]
+
+  ownedConversations Conversation[]   @relation("ConversationAgent")
+  endedConversations Conversation[]   @relation("ConversationEndedBy")
+  sentMessages       Message[]        @relation("MessageSentBy")
+  sharedProperties   SharedProperty[] @relation("SharedByUser")
+  searchActivities   SearchActivity[] @relation("SearchAgent")
+  // Future enhancement: bind an agent to specific areas (localities) within their
+  // city. Empty = the agent covers the whole city (current behaviour). Enforcement
+  // in the query layer is added later; the relation is here so it's a non-breaking
+  // rollout (backend + admin UI can populate it now).
+  assignedAreas      Locality[]       @relation("AgentAssignedAreas")
+  // Leads auto-assigned to this agent (round-robin / even-load distribution).
+  assignedLeads      Lead[]           @relation("LeadAssignedAgent")
+  // Lead-return records this agent created (unassigned-with-reason) and any they dismissed.
+  agentUnassignments     LeadUnassignment[] @relation("AgentUnassignments")
+  dismissedUnassignments LeadUnassignment[] @relation("DismissedUnassignments")
+  deletedTeleduceLeads   DeletedTeleduceLead[] @relation("DeletedTeleduceLeadBy")
+
+  // (email is already indexed by @unique — no separate @@index needed)
+  @@map("users")
+}
+
+model Locality {
+  id                          Int      @id @default(autoincrement())
+  city                        City
+  name                        String
+  latitude                    Float
+  longitude                   Float
+  // True when lat/long were not supplied on admin creation and fall back to the
+  // city centroid — matching still works but is coarse until real coordinates are set.
+  approxCoords                Boolean  @default(false)
+  // Exact label as it appears in Teleduce "Area of Interest" — powers sync + writeback mapping.
+  teleduceAreaOfInterestValue String?  @unique
+  createdAt                   DateTime @default(now())
+  updatedAt                   DateTime @updatedAt
+
+  properties      Property[]
+  interestedLeads Lead[]     @relation("LeadPreferredLocalities")
+  assignedAgents  User[]     @relation("AgentAssignedAreas")
+
+  @@unique([city, name])
+  @@index([city])
+  @@map("localities")
+}
+
+model Property {
+  id                      String                  @id @default(cuid())
+  fileNo                  String                  @unique // internal inventory ref, e.g. FRHBAN338
+  // Optional government RERA registration number. Only when present does the
+  // portfolio PDF assert "Govt. Registered"; otherwise it shows the file reference.
+  reraId                  String?
+  city                    City
+  localityId              Int
+  transactionType         TransactionType
+  propertyType            PropertyType
+  commercialOrResidential CommercialOrResidential @default(RESIDENTIAL)
+  buildingClassification  BuildingClassification? // Gated community / Stand alone / Commercial
+  bhk                     Int? // null for PLOT / land
+  builtUpAreaSqft         Int?
+  secondaryAreaSqft       Int?
+  facing                  String?
+  floor                   String?
+  parkingCount            Int?
+  // Canonical absolute rupee value used for all matching/sorting:
+  //   SALE  -> total sale price in INR
+  //   RENT  -> monthly rent in INR
+  priceInr                Decimal                 @db.Decimal(15, 2)
+  priceUnit               PriceUnit // display hint (LAKH / CRORE / PER_MONTH)
+  pricePerSqft            Decimal?                @db.Decimal(12, 2)
+  maintenanceAmount       Decimal?                @db.Decimal(12, 2)
+  ageYears                Int?
+  furnishing              Furnishing?
+  featuresText            String?
+  additionalFeatures      String[]                @default([])
+  availabilityStatus      AvailabilityStatus      @default(AVAILABLE)
+  builderDeveloperName    String?
+  description             String?
+  createdById             String?
+  createdAt               DateTime                @default(now())
+  updatedAt               DateTime                @updatedAt
+  deletedAt               DateTime?
+
+  locality    Locality             @relation(fields: [localityId], references: [id])
+  createdBy   User?                @relation("PropertyCreatedBy", fields: [createdById], references: [id])
+  attachments PropertyAttachment[]
+  matches     Match[]
+  shares      SharedProperty[]
+
+  @@index([city, availabilityStatus, transactionType])
+  @@index([localityId, transactionType, propertyType, bhk])
+  @@index([city, transactionType, availabilityStatus, propertyType, bhk])
+  @@map("properties")
+}
+
+model PropertyAttachment {
+  id               String         @id @default(cuid())
+  propertyId       String
+  kind             AttachmentKind
+  r2Key            String // object key in the S3/R2 bucket
+  originalFilename String
+  mimeType         String
+  sizeBytes        Int
+  uploadedAt       DateTime       @default(now())
+
+  property Property @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+
+  @@index([propertyId])
+  @@map("property_attachments")
+}
+
+model Lead {
+  id                   String           @id @default(cuid())
+  teleduceLeadId       String?          @unique
+  city                 City
+  firstName            String
+  lastName             String?
+  mobile               String?
+  email                String?
+  budgetMin            Decimal?         @db.Decimal(15, 2)
+  budgetMax            Decimal?         @db.Decimal(15, 2)
+  transactionTypePref  TransactionType?
+  propertyTypePref     PropertyType[]   @default([])
+  bhkPref              Int[]            @default([])
+  currentStage         String           @default("Not yet contacted")
+  teleduceStageId      Int?
+  leadSource           String?
+  leadOwner            String? // Teleduce CRM owner NAME (external string, not an FK)
+  // Internal agent this lead is auto-assigned to (round-robin / even-load), distinct
+  // from the external leadOwner. Nullable — set at ingestion or by an admin override.
+  assignedAgentId      String?
+  assignedAt           DateTime?
+  assignmentSource     AssignmentSource?
+  // The assigned agent's personal working status + free-text feedback on this lead.
+  // Reset (NEW / null) whenever the lead is (re)assigned, so each agent starts fresh.
+  assignmentStatus     AssignmentStatus @default(NEW)
+  assignmentNote       String?
+  rawPayload           Json?
+  isArchivedInTeleduce Boolean          @default(false)
+  lastSyncedAt         DateTime?
+  createdAt            DateTime         @default(now())
+  updatedAt            DateTime         @updatedAt
+
+  preferredLocalities Locality[]       @relation("LeadPreferredLocalities")
+  assignedAgent       User?            @relation("LeadAssignedAgent", fields: [assignedAgentId], references: [id], onDelete: SetNull)
+  matches             Match[]
+  conversations       Conversation[]
+  sharedProperties    SharedProperty[]
+  searchActivities    SearchActivity[]
+  notifications       Notification[]
+  unassignments       LeadUnassignment[]
+
+  @@index([city, currentStage])
+  @@index([isArchivedInTeleduce])
+  @@index([updatedAt])
+  // Leads list default sort + default WHERE: newest-pulled first, archived hidden.
+  // Also serves the "pulled in the last 30 min / 1 hour / …" window filter.
+  @@index([isArchivedInTeleduce, createdAt])
+  // Per-agent load counts + "leads assigned to agent X" filter.
+  @@index([assignedAgentId])
+  @@map("leads")
+}
+
+// An agent returning a lead to the pool WITH a reason. Persisted as history and
+// surfaced to admins ("Leads unassigned by agents") until the lead is re-assigned
+// (which drops it from the actionable view) or an admin dismisses it.
+model LeadUnassignment {
+  id            String    @id @default(cuid())
+  leadId        String
+  lead          Lead      @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  agentId       String // the agent who returned the lead
+  agent         User      @relation("AgentUnassignments", fields: [agentId], references: [id], onDelete: Cascade)
+  reason        String
+  createdAt     DateTime  @default(now())
+  dismissedAt   DateTime?
+  dismissedById String?
+  dismissedBy   User?     @relation("DismissedUnassignments", fields: [dismissedById], references: [id], onDelete: SetNull)
+
+  @@index([dismissedAt, createdAt])
+  @@index([leadId])
+  @@map("lead_unassignments")
+}
+
+// Teleduce ids of leads an admin PERMANENTLY deleted. The pull/webhook skip these so a
+// still-present Corefactors lead is never re-created — the deletion stays permanent.
+model DeletedTeleduceLead {
+  teleduceLeadId String   @id
+  deletedById    String?
+  deletedBy      User?    @relation("DeletedTeleduceLeadBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  deletedAt      DateTime @default(now())
+
+  @@map("deleted_teleduce_leads")
+}
+
+model Match {
+  id                           String          @id @default(cuid())
+  leadId                       String
+  propertyId                   String
+  band                         Int // 0 = same locality, 1 = <=3km, 2 = <=5km, 3 = across city
+  distanceKm                   Float?
+  criteriaSnapshot             Json // hard filters and scores used for the decision
+  status                       MatchStatus     @default(SHORTLISTED)
+  statusReason                 String?
+  actionedById                 String?
+  actionedAt                   DateTime?
+  teleduceWritebackStatus      WritebackStatus @default(NOT_REQUIRED)
+  teleduceWritebackAt          DateTime?
+  // CRM writeback retry bookkeeping: exponential backoff + attempt cap.
+  teleduceWritebackAttempts    Int             @default(0)
+  teleduceWritebackNextRetryAt DateTime?
+  createdAt                    DateTime        @default(now())
+  updatedAt                    DateTime        @updatedAt
+
+  lead       Lead           @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  property   Property       @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  actionedBy User?          @relation("MatchActionedBy", fields: [actionedById], references: [id])
+  history    MatchHistory[]
+
+  @@unique([leadId, propertyId])
+  @@index([leadId, status])
+  @@index([propertyId, status])
+  @@index([teleduceWritebackStatus, teleduceWritebackNextRetryAt]) // writeback retry-queue scan
+  @@map("matches")
+}
+
+// Append-only timeline of every status change on a Match — so re-marking a pair
+// (the Match row is unique per lead+property and gets overwritten) never loses the
+// prior decision/reasoning.
+model MatchHistory {
+  id               String      @id @default(cuid())
+  matchId          String
+  match            Match       @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  status           MatchStatus
+  statusReason     String?
+  band             Int
+  changedById      String? // user id (no FK — history is immutable even if the user is removed)
+  criteriaSnapshot Json?
+  createdAt        DateTime    @default(now())
+
+  @@index([matchId, createdAt])
+  @@map("match_history")
+}
+
+// Server-side staging of a previewed inventory import. The wizard stores the
+// validated/mapped rows here at preview time and commits by id, so the rows are
+// never round-tripped through (and tamperable in) a client form field.
+model ImportBatch {
+  id          String   @id @default(cuid())
+  createdById String
+  rowsJson    Json
+  createdAt   DateTime @default(now())
+
+  @@index([createdById, createdAt])
+  @@map("import_batches")
+}
+
+model SyncLog {
+  id               String     @id @default(cuid())
+  syncType         SyncType
+  status           SyncStatus @default(RUNNING)
+  startedAt        DateTime   @default(now())
+  finishedAt       DateTime?
+  recordsProcessed Int        @default(0)
+  recordsFailed    Int        @default(0)
+  message          String?
+  errorDetails     Json?
+
+  @@index([syncType, startedAt])
+  @@index([syncType, status, finishedAt]) // dashboard "last successful pull" lookup
+  @@map("sync_log")
+}
+
+// Records each sign-in attempt so login can rate-limit / lock out brute force and
+// credential-stuffing. DB-backed so it works across scale-to-zero replicas.
+model LoginAttempt {
+  id        String   @id @default(cuid())
+  email     String
+  ipAddress String?
+  success   Boolean
+  createdAt DateTime @default(now())
+
+  @@index([email, createdAt])
+  @@index([ipAddress, createdAt])
+  @@map("login_attempts")
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  userId     String?
+  action     String
+  entityType String
+  entityId   String?
+  beforeJson Json?
+  afterJson  Json?
+  ipAddress  String?
+  createdAt  DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id])
+
+  @@index([createdAt])
+  @@index([entityType, entityId])
+  @@index([userId]) // "this user's actions" lookups
+  @@map("audit_log")
+}
+
+// ─────────────────── Lead Notifications ────────────────────────────────────────
+// One row per new lead created via the Teleduce webhook (or pull). Admins see the
+// full history in /admin/notifications; unread count is shown in the nav badge.
+
+model Notification {
+  id        String   @id @default(cuid())
+  leadId    String
+  title     String
+  body      String
+  source    String   @default("webhook") // "webhook" | "pull"
+  isRead    Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  lead Lead @relation(fields: [leadId], references: [id], onDelete: Cascade)
+
+  @@index([createdAt])
+  @@index([isRead, createdAt])
+  @@map("notifications")
+}
+
+// ───────────────────── Customer messaging (WhatsApp) ──────────────────────────
+// Agents/admins converse with a lead's customer over WhatsApp and share property
+// details (text + generated PDF + images + brochures), with full tracking for
+// admin oversight. Exactly ONE ACTIVE conversation may exist per lead at a time
+// (exclusive lock enforced by a partial unique index added in the migration);
+// ownership is a single mutable agentId so a future transfer is a backend update,
+// not a schema change.
+
+enum ConversationStatus {
+  ACTIVE
+  ENDED
+}
+
+enum MessageDirection {
+  INBOUND
+  OUTBOUND
+}
+
+enum MessageType {
+  TEXT
+  TEMPLATE
+  IMAGE
+  DOCUMENT
+  AUDIO
+  OTHER
+}
+
+enum MessageStatus {
+  QUEUED // outbound, not yet sent to WhatsApp
+  SENT
+  DELIVERED
+  READ
+  FAILED
+  RECEIVED // inbound from the customer
+}
+
+model Conversation {
+  id                      String             @id @default(cuid())
+  leadId                  String
+  agentId                 String // owner — mutable to support a future transfer/reassign
+  customerPhone           String
+  status                  ConversationStatus @default(ACTIVE)
+  startedAt               DateTime           @default(now())
+  lastMessageAt           DateTime?
+  endedAt                 DateTime?
+  endedById               String?
+  // WhatsApp 24h customer-care window — set/extended when the customer messages in.
+  // Outside it, only approved templates may be sent.
+  customerWindowExpiresAt DateTime?
+  createdAt               DateTime           @default(now())
+  updatedAt               DateTime           @updatedAt
+
+  lead             Lead             @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  agent            User             @relation("ConversationAgent", fields: [agentId], references: [id])
+  endedBy          User?            @relation("ConversationEndedBy", fields: [endedById], references: [id])
+  messages         Message[]
+  sharedProperties SharedProperty[]
+  searchActivities SearchActivity[]
+
+  // NOTE: a partial unique index `(leadId) WHERE status = 'ACTIVE'` is added in the
+  // migration SQL to guarantee at most one active conversation per lead (race-safe).
+  @@index([leadId, status])
+  @@index([agentId, status])
+  @@map("conversations")
+}
+
+model Message {
+  id              String           @id @default(cuid())
+  conversationId  String
+  channel         String           @default("WHATSAPP")
+  direction       MessageDirection
+  type            MessageType      @default(TEXT)
+  body            String? // text content / template-rendered text / media caption
+  templateName    String?
+  // If we sent one of our own files, link it; else an external media reference.
+  attachmentId    String?
+  mediaUrl        String?
+  waMessageId     String?          @unique // WhatsApp wamid — dedupes inbound + status callbacks
+  status          MessageStatus    @default(QUEUED)
+  sentById        String? // agent who sent (outbound); null for inbound
+  errorDetail     String?
+  rawJson         Json?
+  sentAt          DateTime?
+  statusUpdatedAt DateTime?
+  createdAt       DateTime         @default(now())
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  sentBy       User?        @relation("MessageSentBy", fields: [sentById], references: [id])
+
+  @@index([conversationId, createdAt])
+  @@map("messages")
+}
+
+model SharedProperty {
+  id               String   @id @default(cuid())
+  conversationId   String
+  leadId           String
+  propertyId       String
+  messageId        String? // the message that delivered it
+  matchId          String? // link to a Match decision, if any
+  sharedById       String
+  includedPdf      Boolean  @default(false)
+  includedImages   Boolean  @default(false)
+  includedBrochure Boolean  @default(false)
+  includedText     Boolean  @default(true)
+  // Property details captured AT SHARE TIME so admin oversight shows exactly what
+  // was sent even if the property later changes.
+  snapshotJson     Json
+  sharedAt         DateTime @default(now())
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  lead         Lead         @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  property     Property     @relation(fields: [propertyId], references: [id])
+  sharedBy     User         @relation("SharedByUser", fields: [sharedById], references: [id])
+
+  @@index([conversationId])
+  @@index([leadId])
+  @@index([propertyId])
+  @@map("shared_properties")
+}
+
+model SearchActivity {
+  id                 String   @id @default(cuid())
+  conversationId     String?
+  leadId             String
+  agentId            String
+  // The criteria the agent searched with (radius, localities, filters).
+  criteriaJson       Json
+  // The property ids returned at that moment + an optional light snapshot, so admin
+  // oversight can reconstruct "what the agent saw at that point in time".
+  resultPropertyIds  String[] @default([])
+  resultSnapshotJson Json?
+  createdAt          DateTime @default(now())
+
+  conversation Conversation? @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+  lead         Lead          @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  agent        User          @relation("SearchAgent", fields: [agentId], references: [id])
+
+  @@index([leadId, createdAt])
+  @@index([agentId, createdAt])
+  @@index([conversationId])
+  @@map("search_activities")
+}

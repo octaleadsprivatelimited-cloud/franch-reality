@@ -1,0 +1,59 @@
+# Local development infrastructure for Franch Realty.
+# Non-default host ports reduce collisions with other local PostgreSQL and MinIO services.
+# Postgres -> 5433, MinIO (S3/R2-compatible) -> 9100 (API) / 9101 (console).
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: franch-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: franch
+      POSTGRES_PASSWORD: franch_dev_pw
+      POSTGRES_DB: franch_realty
+    ports:
+      - "5433:5432"
+    volumes:
+      - franch_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U franch -d franch_realty"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    container_name: franch-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: franch_minio
+      MINIO_ROOT_PASSWORD: franch_minio_dev_pw
+    ports:
+      - "9100:9000"
+      - "9101:9001"
+    volumes:
+      - franch_minio:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # One-shot job: create the attachments bucket on startup.
+  minio-setup:
+    image: minio/mc:latest
+    container_name: franch-minio-setup
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 franch_minio franch_minio_dev_pw;
+      mc mb --ignore-existing local/franch-attachments;
+      mc anonymous set none local/franch-attachments;
+      echo 'MinIO bucket ready';
+      "
+
+volumes:
+  franch_pgdata:
+  franch_minio:
